@@ -8,23 +8,6 @@ back-ported — upgrade to the newest `1.x` to receive fixes. The API is
 stable under [Semantic Versioning](https://semver.org/), so an upgrade
 within `1.x` should never require code changes.
 
-## Reporting a vulnerability
-
-Please **do not** open a public issue for security problems.
-
-Use GitHub's private vulnerability-reporting channel instead:
-
-1. Go to the [Security tab](https://github.com/ugparu/gopuretrack/security)
-   of this repository.
-2. Click **Report a vulnerability**.
-3. Provide a description, reproduction steps, and — if you have one —
-   a suggested fix.
-
-You should receive an acknowledgment within **72 hours**. If the report
-is confirmed, a fix will be prepared, a GitHub Security Advisory
-published, and a patched release tagged. Credit will be given in the
-advisory unless you prefer to remain anonymous.
-
 ## Scope
 
 The tracker reads in-memory detection structs provided by the caller
