@@ -24,8 +24,9 @@ jobs:
           check-latest: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v7 of the action is the first release that supports golangci-lint v2.
+        uses: golangci/golangci-lint-action@v7
         with:
-          # Pin to a v2 release line so config-schema changes do not surprise
-          # the job. Bump deliberately when adopting new v2 features.
-          version: v2.0.2
+          # Pin to a v2 minor line — the action resolves it to the latest
+          # patch. Bump deliberately when adopting new v2 features.
+          version: v2.11
