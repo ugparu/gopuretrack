@@ -13,6 +13,12 @@ jobs:
   test:
     name: test (${{ matrix.os }}, go ${{ matrix.go }})
     runs-on: ${{ matrix.os }}
+    # Use bash (git-bash on Windows) on every runner. Otherwise PowerShell
+    # on windows-latest mis-tokenizes `-coverprofile=coverage.out` and Go
+    # tries to resolve `.out` as a package path.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
