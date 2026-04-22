@@ -38,9 +38,10 @@ func BenchmarkTracker(b *testing.B) {
 }
 
 func BenchmarkTrackerWithEmbs(b *testing.B) {
-	// Only MOT17-09's emb fixture ships in-repo, capped to the first 10 frames.
+	// Only MOT17-09's emb fixture ships in-repo (other sequences' embeddings
+	// would exceed ~200 MB each). The full 262-frame sequence is replayed.
 	const seq = "MOT17-09"
-	frames := loadSequenceFrames(b, seq, true, 10)
+	frames := loadSequenceFrames(b, seq, true, 0)
 	meta := imgSize[seq]
 
 	b.ReportAllocs()
@@ -74,7 +75,7 @@ func loadSequenceFrames(tb testing.TB, seq string, withReID bool, limitFrames in
 
 	var embRows [][]float64
 	if withReID {
-		embRows = loadRows(tb, filepath.Join("testdata", "embs", seq+".json"))
+		embRows = loadEmbRows(tb, filepath.Join("testdata", "embs", seq+".json"))
 	}
 
 	perFrame := make(map[int][]int, len(detsRows))

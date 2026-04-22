@@ -3,10 +3,7 @@
 // cosine-distance matrices, visibility ratios, and L2 normalization.
 package utils
 
-import (
-	"math"
-	"slices"
-)
+import "math"
 
 // XYXY2XYWH converts a corner box (x1, y1, x2, y2) to a center-plus-size
 // box (xc, yc, w, h).
@@ -216,24 +213,4 @@ func L2Normalize(v []float64) {
 	for i := range v {
 		v[i] *= inv
 	}
-}
-
-// SearchInMap returns the keys whose values satisfy the predicate f.
-// Iteration order follows the map's own, so callers that need a stable
-// order must sort the result themselves.
-func SearchInMap[K comparable, V any](pool map[K]V, f func(V) bool) []K {
-	var keys []K
-	for k, v := range pool {
-		if f(v) {
-			keys = append(keys, k)
-		}
-	}
-	return keys
-}
-
-// AdjustSliceSize returns a slice of the requested length whose backing
-// array has capacity for at least size elements, reusing the input's
-// allocation when possible.
-func AdjustSliceSize[T any](slice []T, size int) []T {
-	return slices.Grow(slice, size)[:size]
 }

@@ -46,7 +46,7 @@ jobs:
       - name: Test (race, coverage)
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
-      - name: Upload coverage
+      - name: Upload coverage artifact
         if: matrix.os == 'ubuntu-latest' && matrix.go == '1.24.x'
         uses: actions/upload-artifact@v4
         with:

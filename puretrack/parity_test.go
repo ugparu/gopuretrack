@@ -1,6 +1,8 @@
 package puretrack
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -16,12 +18,17 @@ import (
 // boxes, id stability) against a stored reference.
 //
 // Fixtures live under testdata/:
-//   dets/MOT17-XX.json                detections, one file per sequence
-//   embs/MOT17-09.json                MOT17-09 embeddings, capped at the
-//                                     first 10 frames to keep the fixture
-//                                     small enough to ship in-repo
+//   dets/MOT17-XX.json                detections, one file per sequence,
+//                                     format {"rows":[[frame,x1,y1,x2,y2,
+//                                     conf,cls],...]}
+//   embs/MOT17-09.json                MOT17-09 embeddings, full sequence
+//                                     (262 frames, ~62 MB). Stored as
+//                                     {"shape":[N,D],"data_b64":"..."} — raw
+//                                     little-endian float32 in base64. This
+//                                     is ~4× smaller than the text-float
+//                                     form (~230 MB) with identical bits.
 //   reference/MOT17-XX_no_embs.json   no-ReID reference for all sequences
-//   reference/MOT17-09_with_embs.json ReID reference, 10-frame cap
+//   reference/MOT17-09_with_embs.json full ReID reference for MOT17-09
 //
 // The parity ceiling (bbox ℓ∞ ≈ 7e-5) is bounded by float32 precision in
 // the reference pipeline. A diff past ~1e-3 indicates a logic regression,
@@ -49,11 +56,19 @@ func (d *parityDet) GetEmbedding() []float64 { return d.emb }
 // Fixture JSON layouts
 // ---------------------------------------------------------------------------
 
-// rowsFile mirrors the on-disk layout of testdata/dets/*.json and
-// testdata/embs/*.json: a single "rows" key holding the 2-D float64 array
-// (upcast from the float32 source).
+// rowsFile mirrors the on-disk layout of testdata/dets/*.json: a single
+// "rows" key holding the 2-D float64 array (upcast from the float32 source).
 type rowsFile struct {
 	Rows [][]float64 `json:"rows"`
+}
+
+// embsFile mirrors the on-disk layout of testdata/embs/*.json: a base64
+// blob of raw little-endian float32 bytes plus the [N, D] shape. Storing as
+// base64 rather than JSON text floats cuts the MOT17-09 fixture from
+// ~230 MB to ~62 MB without any precision loss.
+type embsFile struct {
+	Shape   [2]int `json:"shape"`
+	DataB64 string `json:"data_b64"`
 }
 
 type refFrame struct {
@@ -80,6 +95,39 @@ func loadRows(tb testing.TB, path string) [][]float64 {
 		tb.Fatalf("parse %s: %v", path, err)
 	}
 	return f.Rows
+}
+
+// loadEmbRows reads the base64-packed embeddings fixture and returns the
+// N × D matrix as [][]float64 (upcast from the stored float32 bits).
+func loadEmbRows(tb testing.TB, path string) [][]float64 {
+	tb.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatalf("read %s: %v", path, err)
+	}
+	var f embsFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		tb.Fatalf("parse %s: %v", path, err)
+	}
+	n, d := f.Shape[0], f.Shape[1]
+	raw, err := base64.StdEncoding.DecodeString(f.DataB64)
+	if err != nil {
+		tb.Fatalf("decode %s: %v", path, err)
+	}
+	if len(raw) != n*d*4 {
+		tb.Fatalf("emb byte length %d != %d*%d*4", len(raw), n, d)
+	}
+	out := make([][]float64, n)
+	for i := range n {
+		row := make([]float64, d)
+		base := i * d * 4
+		for j := range d {
+			bits := binary.LittleEndian.Uint32(raw[base+j*4:])
+			row[j] = float64(math.Float32frombits(bits))
+		}
+		out[i] = row
+	}
+	return out
 }
 
 func loadReference(tb testing.TB, path string) refFile {
@@ -172,7 +220,7 @@ func runParity(t *testing.T, seq, mode string, limitFrames int) parityResult {
 
 	var embRows [][]float64
 	if withReID {
-		embRows = loadRows(t, filepath.Join("testdata", "embs", seq+".json"))
+		embRows = loadEmbRows(t, filepath.Join("testdata", "embs", seq+".json"))
 	}
 
 	meta, ok := imgSize[seq]
@@ -194,9 +242,13 @@ func runParity(t *testing.T, seq, mode string, limitFrames int) parityResult {
 	// mapping that can be looked up per-detection below.
 	embIdx := make(map[int]int)
 	if withReID {
+		refFids := make(map[int]struct{}, len(ref.Frames))
+		for _, fr := range ref.Frames {
+			refFids[fr.FrameID] = struct{}{}
+		}
 		next := 0
 		for rowIdx, row := range detsRows {
-			if !refHasFrame(&ref, int(row[0])) {
+			if _, ok := refFids[int(row[0])]; !ok {
 				continue
 			}
 			if next >= len(embRows) {
@@ -287,15 +339,6 @@ func runParity(t *testing.T, seq, mode string, limitFrames int) parityResult {
 	return res
 }
 
-func refHasFrame(r *refFile, fid int) bool {
-	for _, fr := range r.Frames {
-		if fr.FrameID == fid {
-			return true
-		}
-	}
-	return false
-}
-
 // ---------------------------------------------------------------------------
 // Tolerances
 // ---------------------------------------------------------------------------
@@ -322,14 +365,13 @@ func TestParityNoEmbs(t *testing.T) {
 }
 
 func TestParityWithEmbs(t *testing.T) {
-	// Only MOT17-09 is shipped in-repo for the with_embs path — the full
-	// per-sequence embedding file would exceed ~50 MB each. The fixture is
-	// capped at the first 10 frames; the reference JSON is truncated to
-	// match.
+	// Only MOT17-09 is shipped in-repo for the with_embs path — the other
+	// sequences' embedding files would each exceed ~200 MB. MOT17-09 is the
+	// full sequence (262 frames).
 	if testing.Short() {
-		t.Skip("skipping with_embs parity in -short mode (loads 9 MB embedding fixture)")
+		t.Skip("skipping with_embs parity in -short mode (loads ~230 MB embedding fixture)")
 	}
-	res := runParity(t, "MOT17-09", "with_embs", 10)
+	res := runParity(t, "MOT17-09", "with_embs", 0)
 	checkParity(t, res)
 }
 
