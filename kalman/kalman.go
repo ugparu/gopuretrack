@@ -1,259 +1,268 @@
+// Package kalman implements a constant-velocity Kalman filter on bounding
+// boxes in (x, y, w, h) coordinates. The state vector is
+// [x, y, w, h, vx, vy, vw, vh] and the measurement vector is [x, y, w, h].
+//
+// The filter supports NSA (Noise Scale Adaptation, Du et al., GIAOTracker):
+// per-measurement noise R is scaled by (1 - conf)² so that low-confidence
+// detections contribute less to the posterior.
 package kalman
 
 import (
-	"sync"
 	"unsafe"
 
 	"gonum.org/v1/gonum/mat"
 )
 
-const (
-	stdWeightPosition = 0.05
-	stdWeightVelocity = 0.00625
+// ndim is the number of spatial dimensions. The state vector is 2·ndim
+// (position + velocity) and the measurement vector is ndim.
+const ndim = 4
 
-	stdWeightPositionx2  = stdWeightPosition * 2
-	stdWeightVelocityx10 = stdWeightVelocity * 10
+// Config holds the tunable noise weights for the filter.
+type Config struct {
+	// Process-noise standard deviations, expressed as a fraction of the
+	// current bbox width/height. Applied each predict step.
+	StdProcessPos  float64
+	StdProcessVel  float64
+	StdMeasurement float64
 
-	ndim = 4
-)
-
-var (
-	stdPosVec = mat.NewVecDense(4, []float64{stdWeightPosition, stdWeightPosition, stdWeightPosition, stdWeightPosition})
-	stdVelVec = mat.NewVecDense(4, []float64{stdWeightVelocity, stdWeightVelocity, stdWeightVelocity, stdWeightVelocity})
-
-	stdPosx2Velx10Vec = mat.NewVecDense(8, []float64{stdWeightPositionx2, stdWeightPositionx2, stdWeightPositionx2, stdWeightPositionx2, stdWeightVelocityx10, stdWeightVelocityx10, stdWeightVelocityx10, stdWeightVelocityx10})
-)
-
-type Filter interface {
-	MultiPredict(means [][8]float64, covs [][64]float64)
-	MultiUpdate(means [][8]float64, covs [][64]float64, measurements [][4]float64)
-	MultiInitiate(measurments [][4]float64, means [][8]float64, covs [][64]float64)
+	// Multipliers applied to StdProcessPos / StdProcessVel when a track is
+	// born. Larger values make the filter less confident in the initial
+	// state, which widens the gate for the first association.
+	InitPosCovFactor float64
+	InitVelCovFactor float64
 }
 
-type filter struct {
-	MotionMat *mat.Dense
-	UpdateMat *mat.Dense
+// Filter is a batched (x, y, w, h) Kalman filter. A Filter is stateless
+// with respect to tracks — all per-track state is passed in by the caller —
+// but not safe for concurrent use because the scratch matrices are shared.
+type Filter struct {
+	cfg Config
+
+	motionMat, motionMatT *mat.Dense // 8×8 transition F and its transpose
+	updateMat, updateMatT *mat.Dense // 4×8 measurement H and its transpose
 }
 
-var once = new(sync.Once)
-var filterInstance *filter
-
-func GetFilter() Filter {
-	once.Do(func() {
-		filterInstance = newBaseKalmanFilter()
-	})
-	return filterInstance
-}
-
-func newBaseKalmanFilter() *filter {
-	dt := 1.0
-	motionMat := mat.NewDense(2*ndim, 2*ndim, nil)
-	updateMat := mat.NewDense(ndim, 2*ndim, nil)
-
-	for i := 0; i < 2*ndim; i++ {
-		motionMat.Set(i, i, 1.0)
-		if i < ndim {
-			motionMat.Set(i, ndim+i, dt)
-		}
+// New builds a Filter from cfg. The transition matrix encodes a unit time
+// step (dt = 1), so callers that need a different frame cadence should
+// scale their process-noise weights accordingly.
+func New(cfg Config) *Filter {
+	motion := mat.NewDense(2*ndim, 2*ndim, nil)
+	for i := range 2 * ndim {
+		motion.Set(i, i, 1.0)
 	}
-
-	for i := 0; i < ndim; i++ {
-		updateMat.Set(i, i, 1.0)
+	for i := range ndim {
+		motion.Set(i, ndim+i, 1.0)
 	}
-
-	return &filter{
-		MotionMat: motionMat,
-		UpdateMat: updateMat,
+	update := mat.NewDense(ndim, 2*ndim, nil)
+	for i := range ndim {
+		update.Set(i, i, 1.0)
+	}
+	return &Filter{
+		cfg:        cfg,
+		motionMat:  motion,
+		motionMatT: denseT(motion),
+		updateMat:  update,
+		updateMatT: denseT(update),
 	}
 }
 
-func (kf *filter) GetInitialCovariancesStd(measurements [][4]float64) [][8]float64 {
-	result := make([][8]float64, len(measurements))
+func denseT(m *mat.Dense) *mat.Dense {
+	r, c := m.Dims()
+	out := mat.NewDense(c, r, nil)
+	out.Copy(m.T())
+	return out
+}
+
+// MultiInitiate writes birth means and covariances into the caller-supplied
+// buffers for a batch of (x, y, w, h) measurements. The initial mean sets
+// position to the measurement and velocity to zero. The covariance is
+// diagonal with entries (init_factor · std · dim)² where dim cycles over
+// [w, h, w, h] for both the position and velocity blocks.
+func (f *Filter) MultiInitiate(measurements [][4]float64, means [][8]float64, covs [][64]float64) {
+	posFactor := f.cfg.InitPosCovFactor * f.cfg.StdProcessPos
+	velFactor := f.cfg.InitVelCovFactor * f.cfg.StdProcessVel
 	for i, m := range measurements {
-		m2 := m[2]
-		m3 := m[3]
-
-		m23232323 := mat.NewVecDense(8, []float64{m2, m3, m2, m3, m2, m3, m2, m3})
-		m23232323.MulElemVec(stdPosx2Velx10Vec, m23232323)
-		result[i] = [8]float64(m23232323.RawVector().Data)
-	}
-
-	return result
-}
-
-func (kf *filter) GetMeasurementNoisesStd(means [][4]float64) [][4]float64 {
-	noisesStd := make([][4]float64, len(means))
-	for i, m := range means {
-		m2 := m[2]
-		m3 := m[3]
-
-		m2323 := mat.NewVecDense(4, []float64{m2, m3, m2, m3})
-		m2323.MulElemVec(m2323, stdPosVec)
-		noisesStd[i] = [4]float64(m2323.RawVector().Data)
-	}
-
-	return noisesStd
-}
-
-func (kf *filter) GetMultiProcessNoiseStd(means [][4]float64) ([][4]float64, [][4]float64) {
-	stdPos := make([][4]float64, len(means))
-	stdVel := make([][4]float64, len(means))
-
-	for i, m := range means {
-		m2 := m[2]
-		m3 := m[3]
-
-		m2323 := mat.NewVecDense(4, []float64{m2, m3, m2, m3})
-		m2323.MulElemVec(m2323, stdPosVec)
-		stdPos[i] = [4]float64(m2323.RawVector().Data)
-
-		m2323.SetVec(0, m2)
-		m2323.SetVec(1, m3)
-		m2323.SetVec(2, m2)
-		m2323.SetVec(3, m3)
-		m2323.MulElemVec(m2323, stdVelVec)
-		stdVel[i] = [4]float64(m2323.RawVector().Data)
-	}
-
-	return stdPos, stdVel
-}
-
-func (df *filter) MultiInitiate(m [][4]float64, means [][8]float64, covs [][64]float64) {
-	for i, measurement := range m {
-		copy(means[i][:4], measurement[:])
-		means[i][4] = 0
-		means[i][5] = 0
-		means[i][6] = 0
-		means[i][7] = 0
+		copy(means[i][:4], m[:])
+		means[i][4], means[i][5], means[i][6], means[i][7] = 0, 0, 0, 0
 
 		for j := range covs[i] {
 			covs[i][j] = 0
 		}
-
-		std := df.GetInitialCovariancesStd([][4]float64{measurement})[0]
-		for j := 0; j < 8; j++ {
-			covs[i][j*8+j] = std[j] * std[j]
+		w, h := m[2], m[3]
+		posStds := [4]float64{posFactor * w, posFactor * h, posFactor * w, posFactor * h}
+		velStds := [4]float64{velFactor * w, velFactor * h, velFactor * w, velFactor * h}
+		for j := range 4 {
+			covs[i][j*8+j] = posStds[j] * posStds[j]
+			covs[i][(j+4)*8+(j+4)] = velStds[j] * velStds[j]
 		}
 	}
 }
 
-func (df *filter) MultiPredict(means [][8]float64, covs [][64]float64) {
-	if len(means) == 0 {
+// MultiPredict advances means and covariances in place:
+//
+//	x ← F · x,   P ← F · P · Fᵀ + Q
+//
+// Q is diagonal with entries
+//
+//	(std_pos · [w, h, w, h, std_vel·w, std_vel·h, …])²
+//
+// computed from the *pre-predict* width and height. Sampling Q before the
+// state update preserves the association between a track's current size
+// and its next-step uncertainty.
+func (f *Filter) MultiPredict(means [][8]float64, covs [][64]float64) {
+	n := len(means)
+	if n == 0 {
 		return
 	}
 
-	croppedMeans := make([][4]float64, len(means))
-	for i, m := range means {
-		copy(croppedMeans[i][:], m[:4])
-	}
-
-	pos, vel := df.GetMultiProcessNoiseStd(croppedMeans)
-
-	c := len(means)
-	sqr := mat.NewDense(c, 8, nil)
-	for i := 0; i < c; i++ {
-		sqr.SetRow(i, append(pos[i][:], vel[i][:]...))
-	}
-	sqr.MulElem(sqr, sqr)
-
-	motionCov := make([]*mat.Dense, c)
-	for i := 0; i < c; i++ {
-		motionCov[i] = mat.NewDense(8, 8, nil)
-		for j := 0; j < 8; j++ {
-			motionCov[i].Set(j, j, sqr.At(i, j))
+	qDiags := make([][8]float64, n)
+	pp := f.cfg.StdProcessPos
+	pv := f.cfg.StdProcessVel
+	for i := range n {
+		w, h := means[i][2], means[i][3]
+		qDiags[i] = [8]float64{
+			sq(pp * w), sq(pp * h), sq(pp * w), sq(pp * h),
+			sq(pv * w), sq(pv * h), sq(pv * w), sq(pv * h),
 		}
 	}
 
-	mean := mat.NewDense(c, 8, unsafe.Slice(&means[0][0], 8*c))
-	mean.Mul(mean, df.MotionMat.T())
+	// mean ← mean · Fᵀ. gonum's Mul handles the read/write aliasing safely.
+	meanMat := mat.NewDense(n, 8, unsafe.Slice(&means[0][0], 8*n))
+	meanMat.Mul(meanMat, f.motionMatT)
 
 	left := mat.NewDense(8, 8, nil)
-	for i := 0; i < c; i++ {
+	right := mat.NewDense(8, 8, nil)
+	for i := range n {
+		qDiag := qDiags[i]
+
 		covMat := mat.NewDense(8, 8, covs[i][:])
-		left.Mul(df.MotionMat, covMat)
-		covMat.Mul(left, df.MotionMat.T())
-		covMat.Add(covMat, motionCov[i])
-	}
-}
-
-func (df *filter) MultiProject(means [][8]float64, covs [][64]float64) ([][4]float64, [][16]float64) {
-	croppedMeans := make([][4]float64, len(means))
-	for i, m := range means {
-		copy(croppedMeans[i][:], m[:4])
-	}
-
-	stds := df.GetMeasurementNoisesStd(croppedMeans)
-	stdsMat := mat.NewDense(len(means), 4, unsafe.Slice(&stds[0][0], 4*len(means)))
-
-	c := len(means)
-	innovationCovs := make([]*mat.Dense, c)
-	for i := 0; i < c; i++ {
-		innovationCovs[i] = mat.NewDense(4, 4, nil)
-		for j := 0; j < 4; j++ {
-			innovationCovs[i].Set(j, j, stdsMat.At(i, j)*stdsMat.At(i, j))
+		left.Mul(f.motionMat, covMat)
+		right.Mul(left, f.motionMatT)
+		covMat.Copy(right)
+		for j := range 8 {
+			covs[i][j*8+j] += qDiag[j]
 		}
 	}
-
-	projectedMeans := make([][4]float64, c)
-	projectedMeansMat := mat.NewDense(c, 4, unsafe.Slice(&projectedMeans[0][0], 4*c))
-	mean := mat.NewDense(c, 8, unsafe.Slice(&means[0][0], 8*c))
-	projectedMeansMat.Mul(mean, df.UpdateMat.T())
-
-	projectedCovs := make([][16]float64, c)
-	for i := 0; i < c; i++ {
-		projectedCovMat := mat.NewDense(4, 4, unsafe.Slice(&projectedCovs[i][0], 4*4))
-		covMat := mat.NewDense(8, 8, covs[i][:])
-
-		tmpMat := mat.NewDense(4, 8, nil)
-		tmpMat.Mul(df.UpdateMat, covMat)
-		projectedCovMat.Mul(tmpMat, df.UpdateMat.T())
-		projectedCovMat.Add(projectedCovMat, innovationCovs[i])
-	}
-
-	return projectedMeans, projectedCovs
 }
 
-func (df *filter) MultiUpdate(means [][8]float64, covs [][64]float64, measurements [][4]float64) {
-	if len(means) == 0 {
+// MultiProject returns the projected means (4-vector) and covariances
+// (4×4 flattened row-major) in measurement space. confs carries per-track
+// detection confidence and enables NSA; a nil slice is equivalent to
+// conf=0 for every track (no NSA scaling — R is used as-is).
+func (f *Filter) MultiProject(means [][8]float64, covs [][64]float64, confs []float64) ([][4]float64, [][16]float64) {
+	n := len(means)
+	projMeans := make([][4]float64, n)
+	projCovs := make([][16]float64, n)
+	if n == 0 {
+		return projMeans, projCovs
+	}
+
+	// H · x is just the position block of x.
+	for i := range means {
+		copy(projMeans[i][:], means[i][:4])
+	}
+
+	tmp := mat.NewDense(ndim, 2*ndim, nil)
+	for i := range n {
+		covMat := mat.NewDense(8, 8, covs[i][:])
+		projCovMat := mat.NewDense(ndim, ndim, unsafe.Slice(&projCovs[i][0], 16))
+		tmp.Mul(f.updateMat, covMat)
+		projCovMat.Mul(tmp, f.updateMatT)
+
+		conf := 0.0
+		if confs != nil {
+			conf = confs[i]
+		}
+		scale := (1 - conf) * (1 - conf)
+		w, h := means[i][2], means[i][3]
+		sm := f.cfg.StdMeasurement
+		rDiag := [4]float64{sq(sm * w), sq(sm * h), sq(sm * w), sq(sm * h)}
+		for j := range 4 {
+			projCovs[i][j*4+j] += scale * rDiag[j]
+		}
+	}
+	return projMeans, projCovs
+}
+
+// MultiUpdate applies the Kalman correction in place. means, covs and
+// measurements must all have the same length. confs may be nil to disable
+// NSA scaling of the measurement noise.
+func (f *Filter) MultiUpdate(means [][8]float64, covs [][64]float64, measurements [][4]float64, confs []float64) {
+	n := len(means)
+	if n == 0 {
 		return
 	}
 
-	projectedMeans, projectedCovs := df.MultiProject(means, covs)
+	projMeans, projCovs := f.MultiProject(means, covs, confs)
 
-	projectedMeansMat := mat.NewDense(len(means), 4, unsafe.Slice(&projectedMeans[0][0], 4*len(means)))
+	covHT := mat.NewDense(8, ndim, nil)
+	kalmanGain := mat.NewDense(8, ndim, nil)
+	kalmanGainT := mat.NewDense(ndim, 8, nil)
+	tmp84 := mat.NewDense(8, ndim, nil)
+	tmp88 := mat.NewDense(8, 8, nil)
 
-	measurementsMat := mat.NewDense(len(means), 4, unsafe.Slice(&measurements[0][0], 4*len(measurements)))
-
-	c := len(means)
-	innovationMeans := mat.NewDense(c, 4, nil)
-	innovationMeans.Sub(measurementsMat, projectedMeansMat)
-
-	kalmanGain := mat.NewDense(4, 8, nil)
-	innovations := mat.NewDense(c, 8, nil)
-
-	kalmanCov := mat.NewDense(8, 4, nil)
-	newCovariance := mat.NewDense(8, 8, nil)
-
-	for i := 0; i < c; i++ {
-		projectedCovMat := mat.NewDense(4, 4, unsafe.Slice(&projectedCovs[i][0], 4*4))
+	for i := range n {
 		covMat := mat.NewDense(8, 8, covs[i][:])
 
-		ch := &mat.Cholesky{}
-		ch.Factorize(projectedCovMat.DiagView())
+		// Symmetrize the projected covariance to absorb any accumulated
+		// rounding asymmetry before the Cholesky factorization.
+		projCovMat := mat.NewSymDense(ndim, nil)
+		for r := range ndim {
+			for c := r; c < ndim; c++ {
+				v := 0.5 * (projCovs[i][r*ndim+c] + projCovs[i][c*ndim+r])
+				projCovMat.SetSym(r, c, v)
+			}
+		}
 
-		updatedCovariance := mat.NewDense(8, 4, nil)
-		updatedCovariance.Mul(covMat, df.UpdateMat.T())
+		covHT.Mul(covMat, f.updateMatT)
 
-		ch.SolveTo(kalmanGain, updatedCovariance.T())
+		// Solve S · Kᵀ = (P · Hᵀ)ᵀ for the Kalman gain K.
+		var ch mat.Cholesky
+		if !ch.Factorize(projCovMat) {
+			// Near-singular projection — add a tiny ridge and retry.
+			for j := range ndim {
+				projCovMat.SetSym(j, j, projCovMat.At(j, j)+1e-9)
+			}
+			if !ch.Factorize(projCovMat) {
+				// Still singular after the ridge — skip the update for this
+				// track rather than feed garbage through the state. The
+				// filter will have another chance on the next observation.
+				continue
+			}
+		}
+		if err := ch.SolveTo(kalmanGainT, covHT.T()); err != nil {
+			continue
+		}
+		kalmanGain.Copy(kalmanGainT.T())
 
-		innovations.Slice(i, i+1, 0, 8).(*mat.Dense).Mul(innovationMeans.Slice(i, i+1, 0, 4), kalmanGain)
+		var innov [4]float64
+		for j := range ndim {
+			innov[j] = measurements[i][j] - projMeans[i][j]
+		}
 
-		kalmanCov.Mul(kalmanGain.T(), projectedCovMat)
+		var addMean [8]float64
+		for r := range 8 {
+			s := 0.0
+			for c := range ndim {
+				s += kalmanGain.At(r, c) * innov[c]
+			}
+			addMean[r] = s
+		}
+		for r := range 8 {
+			means[i][r] += addMean[r]
+		}
 
-		newCovariance.Mul(kalmanCov, kalmanGain)
-		covMat.Sub(covMat, newCovariance)
+		// P ← P - K · S · Kᵀ.
+		projCovDense := mat.NewDense(ndim, ndim, nil)
+		for r := range ndim {
+			for c := range ndim {
+				projCovDense.Set(r, c, projCovMat.At(r, c))
+			}
+		}
+		tmp84.Mul(kalmanGain, projCovDense)
+		tmp88.Mul(tmp84, kalmanGainT)
+		covMat.Sub(covMat, tmp88)
 	}
-
-	meansMat := mat.NewDense(c, 8, unsafe.Slice(&means[0][0], 8*c))
-	meansMat.Add(meansMat, innovations)
 }
+
+func sq(x float64) float64 { return x * x }

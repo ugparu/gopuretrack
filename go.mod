@@ -1,4 +1,4 @@
-module github.com/ugparu/GoPureTrack
+module github.com/ugparu/gopuretrack
 
 go 1.23.4
 

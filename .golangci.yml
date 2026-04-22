@@ -1,0 +1,206 @@
+# golangci-lint v2 configuration.
+#
+# Scope selection rationale:
+#   - Everything that catches a real bug is on (default + correctness add-ons).
+#   - Stylistic / cosmetic linters stay off unless they prevent a class of
+#     mistakes that humans keep making in review (e.g. error wrapping, naked
+#     returns in long functions, spelling).
+#   - Noisy or opinionated linters (wsl, funlen, gochecknoglobals, lll, dupl,
+#     goconst) stay off — they produce more churn than value in a numerical
+#     library.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  relative-path-mode: gomod
+
+linters:
+  default: none
+  enable:
+    # --- Default set (correctness) -----------------------------------------
+    - errcheck        # unchecked errors
+    - govet           # suspicious constructs from cmd/vet
+    - ineffassign     # assignments whose value is never used
+    - staticcheck     # SA / ST / S / QF / U analyzers bundled as one
+    - unused          # unused identifiers
+
+    # --- Correctness / likely bugs -----------------------------------------
+    - bodyclose                  # missing resp.Body.Close()
+    - errorlint                  # wrapping errors correctly (errors.Is / %w)
+    - gocheckcompilerdirectives  # malformed //go:... directives
+    - makezero                   # make([]T, N) followed by append
+    - nilerr                     # `return nil` after `err != nil`
+    - noctx                      # http request without context.Context
+    - rowserrcheck               # sql.Rows.Err() not checked
+    - sqlclosecheck              # sql.Rows / sql.Stmt not closed
+    - reassign                   # reassignment of top-level variables like io.EOF
+
+    # --- Modernization (Go 1.22+) ------------------------------------------
+    - copyloopvar  # old range-variable capture pattern
+    - intrange     # `for i := 0; i < N; i++` → `for i := range N`
+
+    # --- Performance -------------------------------------------------------
+    # prealloc was deliberately left off: it flags pipeline accumulators
+    # whose final size only becomes known after several intermediate calls,
+    # which cannot be preallocated without changing the algorithm.
+    - perfsprint   # replace fmt.Sprintf with cheaper alternatives
+
+    # --- Security ----------------------------------------------------------
+    - gosec
+
+    # --- Style / consistency ----------------------------------------------
+    - gocritic   # diagnostic / style / performance meta-linter
+    - misspell   # spelling in comments and strings
+    - nakedret   # naked returns in long functions
+    - revive     # golint replacement, only the rules listed below
+    - unconvert  # redundant type conversions
+    - unparam    # unused function parameters
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    govet:
+      enable-all: true
+      disable:
+        # Alignment of struct fields is noise in hot code where the data
+        # layout was chosen deliberately.
+        - fieldalignment
+        # Variable shadowing is idiomatic in Go (especially `if err := ...`),
+        # and flagging it every time produces more noise than signal.
+        - shadow
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: early-return
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-naming
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+        # Unused parameters are already covered by `unparam`, and revive's
+        # version rejects legitimate interface-conformance stubs.
+        - name: unused-parameter
+          disabled: true
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        # Long if/else-if chains are clearer than artificial switch statements
+        # when the branches encode different predicates.
+        - ifElseChain
+        # A single-case switch reads naturally when it foreshadows future
+        # cases; flipping it to `if` makes later additions more disruptive.
+        - singleCaseSwitch
+        # `hugeParam` is useful in hot paths only, and the tracker passes
+        # small fixed-size arrays by value on purpose.
+        - hugeParam
+        # Flagging commented-out code fires on intentional algorithm
+        # annotations (e.g. matrix layout diagrams) more often than on leftovers.
+        - commentedOutCode
+        # Named return values are useful for long functions with ambiguous
+        # return types, but noise when the types are self-documenting
+        # (e.g. `([]Track[T], []Track[T])`).
+        - unnamedResult
+
+    gosec:
+      excludes:
+        # Integer overflow conversion — flags every float→int bbox rounding.
+        - G115
+        # "Potential file inclusion via variable" — the parity tests read
+        # testdata paths built from fixture names.
+        - G304
+        # Slice bounds check — false positive on indexed access into
+        # fixed-size arrays wrapped in slices ([N]float64 via unsafe.Slice).
+        - G602
+
+    misspell:
+      locale: US
+
+    nakedret:
+      max-func-lines: 30
+
+    perfsprint:
+      err-error: true
+      errorf: true
+      sprintf1: true
+      strconcat: true
+
+    unparam:
+      check-exported: false
+
+  exclusions:
+    generated: strict
+    warn-unused: true
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Tests legitimately ignore errors, panic on setup failures, and use
+      # fmt.Sprintf for readability.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+          - gosec
+          - perfsprint
+          - unparam
+
+      # Third-party LAPJV port — we do not own this code's style and keeping
+      # it verbatim makes upstream merges painless.
+      - path: utils/lap/lapjv\.go
+        linters:
+          - errcheck
+          - gocritic
+          - gosec
+          - ineffassign
+          - revive
+          - staticcheck
+          - unconvert
+          - unparam
+          - unused
+
+    paths:
+      - testdata
+      - examples
+      - third_party
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ugparu/gopuretrack
+  exclusions:
+    generated: strict
+    paths:
+      - testdata
+      - examples
+      - third_party
+
+issues:
+  # Show every issue on every PR rather than 50/3 caps — a one-time bulk
+  # cleanup is less painful than discovering new issues one review at a time.
+  max-issues-per-linter: 0
+  max-same-issues: 0

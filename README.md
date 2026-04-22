@@ -1,5 +1,11 @@
 # GoPureTrack
 
+[![CI](https://github.com/ugparu/gopuretrack/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/ugparu/gopuretrack/actions/workflows/ci.yml)
+[![Lint](https://github.com/ugparu/gopuretrack/actions/workflows/lint.yml/badge.svg?branch=master)](https://github.com/ugparu/gopuretrack/actions/workflows/lint.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/ugparu/gopuretrack.svg)](https://pkg.go.dev/github.com/ugparu/gopuretrack)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ugparu/gopuretrack)](https://goreportcard.com/report/github.com/ugparu/gopuretrack)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 GoPureTrack is a high-performance object tracker written in Go. It is inspired by the [DeepSort tracker](https://github.com/nwojke/deep_sort) but incorporates significant modifications and improvements for enhanced performance and flexibility.
 
 ![MOT17-02 GIF](examples/MOT17-02.gif)
@@ -16,7 +22,7 @@ GoPureTrack is a high-performance object tracker written in Go. It is inspired b
 To install GoPureTrack, you need to have Go installed on your system. Use the following command to install it:
 
 ```bash
-go get github.com/ugparu/GoPureTrack
+go get github.com/ugparu/gopuretrack
 ```
 
 ## Usage
@@ -28,7 +34,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/ugparu/GoPureTrack/puretrack"
+	"github.com/ugparu/gopuretrack/puretrack"
 )
 
 type Detection struct {
